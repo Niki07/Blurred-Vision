@@ -42,4 +42,4 @@ TODO
 
 ## License
 
-TODO
+MIT — see [LICENSE](./LICENSE).
