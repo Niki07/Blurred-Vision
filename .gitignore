@@ -1,0 +1,17 @@
+.env
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+venv/
+.venv/
+
+# Large data files (see data/README.md for how to get them)
+data/*.npy
+
+# Experiment output
+results/*.csv
+
+# OS
+.DS_Store
