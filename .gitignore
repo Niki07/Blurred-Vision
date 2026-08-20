@@ -1,5 +1,9 @@
 .env
 
+# Local working notes, not tracked
+ENGINEERING_DECISIONS.md
+CLAUDE.md
+
 # Python
 __pycache__/
 *.pyc
