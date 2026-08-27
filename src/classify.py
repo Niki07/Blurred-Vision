@@ -5,7 +5,7 @@ from io import BytesIO
 
 from PIL import Image
 
-from src.config import CLASSIFICATION_PROMPT
+from src.config import CLASSIFICATION_PROMPT, get_extra_body
 
 
 def image_array_to_base64(image_array):
@@ -14,8 +14,15 @@ def image_array_to_base64(image_array):
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
-def classify_image(client, model_id, image_array):
-    """Return the model's predicted CIFAR-10 label (lowercase, stripped) for one image."""
+def classify_image(client, model_id, image_array, extra_body=None):
+    """Return the model's predicted CIFAR-10 label (lowercase, stripped) for one image.
+
+    extra_body: dict of provider-specific request fields passed through to
+    OpenRouter as-is. Defaults to get_extra_body(model_id) (see config.py) —
+    pass an explicit {} to leave reasoning at the model's own default.
+    """
+    if extra_body is None:
+        extra_body = get_extra_body(model_id)
     base64_image = image_array_to_base64(image_array)
 
     response = client.chat.completions.create(
@@ -32,5 +39,6 @@ def classify_image(client, model_id, image_array):
                 ],
             }
         ],
+        extra_body=extra_body,
     )
     return response.choices[0].message.content.strip().lower()

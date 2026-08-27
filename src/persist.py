@@ -23,3 +23,21 @@ def append_result(row, csv_path):
         writer.writerow(row)
         f.flush()
         os.fsync(f.fileno())
+
+
+def load_completed_keys(csv_path):
+    """Return the (model, blur_type, severity, image_id) keys already in csv_path.
+
+    Used to make a run resumable: skip any call whose result is already on disk,
+    whether the previous run was interrupted or manually paused between models.
+    """
+    completed = set()
+    if not os.path.exists(csv_path):
+        return completed
+
+    with open(csv_path, newline="") as f:
+        for row in csv.DictReader(f):
+            completed.add(
+                (row["model"], row["blur_type"], int(row["severity"]), int(row["image_id"]))
+            )
+    return completed

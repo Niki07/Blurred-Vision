@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from src.config import IMAGES_PER_LEVEL
+from src.config import CIFAR10_LABELS, IMAGES_PER_LEVEL
 
 
 def load_corruption(path):
@@ -18,6 +18,25 @@ def load_labels(path):
 def indices_for_label(labels, label_int):
     """Indices (into the base 10,000 test images) whose ground-truth label matches."""
     return np.where(labels == label_int)[0]
+
+
+def build_fixed_sample(labels, images_per_class):
+    """First `images_per_class` base image indices per class, in dataset order.
+
+    Not a random sample (see ENGINEERING_DECISIONS.md) — deliberately just the
+    first N indices found per class, for simplicity and reproducibility.
+
+    `labels` may be either the 10,000 base labels or the 50,000-length version
+    some CIFAR-10-C releases ship (the base labels tiled once per severity,
+    identical in every block) — only the first IMAGES_PER_LEVEL entries are
+    ever searched, so base image indices stay valid either way.
+    """
+    base_labels = labels[:IMAGES_PER_LEVEL]
+    sample = []
+    for label_int in range(len(CIFAR10_LABELS)):
+        indices = indices_for_label(base_labels, label_int)[:images_per_class]
+        sample.extend(int(index) for index in indices)
+    return sample
 
 
 def get_image(corruption_array, base_image_index, severity):
