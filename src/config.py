@@ -51,14 +51,6 @@ SEVERITIES = [1, 2, 3, 4, 5]
 
 IMAGES_PER_LEVEL = 10000
 
-# Fixed sample size for the real experiment (see ENGINEERING_DECISIONS.md,
-# 2026-08-26): first N base images per class, in dataset order, not random.
-IMAGES_PER_CLASS = 140
-
-# How many images to classify concurrently within a single model's sweep.
-# Kept modest to avoid tripping per-model rate limits on OpenRouter.
-CONCURRENCY = 8
-
 CIFAR10_LABELS = [
     "airplane",
     "automobile",
@@ -84,6 +76,12 @@ airplane, automobile, bird, cat, deer, dog, frog, horse, ship, truck
 Respond with only the label.
 """
 
+# 0 (not each provider's default, typically 1.0) so every model gives its
+# single most-confident answer instead of a randomly sampled one — removes
+# run-to-run sampling noise as a confound on top of the blur-severity effect
+# being measured. See ENGINEERING_DECISIONS.md, 2026-08-28.
+CLASSIFICATION_TEMPERATURE = 0
+
 RESULT_FIELDS = [
     "model",
     "blur_type",
@@ -92,4 +90,23 @@ RESULT_FIELDS = [
     "true_label",
     "prediction",
     "correct",
+]
+
+# Richer schema used by the real data-collection pipeline (src/pipeline.py)
+# and the pilot script — adds exact model ID, the model's raw (non-normalized)
+# text, whether that text was a valid CIFAR-10 label, request latency, and
+# OpenRouter's reported per-call cost. See ENGINEERING_DECISIONS.md.
+DETAILED_RESULT_FIELDS = [
+    "model",
+    "model_id",
+    "blur_type",
+    "severity",
+    "image_id",
+    "true_label",
+    "raw_response",
+    "prediction",
+    "valid_response",
+    "correct",
+    "latency_seconds",
+    "cost_usd",
 ]

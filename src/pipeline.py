@@ -1,69 +1,149 @@
-"""Experiment driver.
+"""Motion-blur data-collection pipeline for the blur-robustness paper.
 
-Runs one model's full sweep (every severity x the fixed image sample) at a
-time, then pauses for manual confirmation before starting the next model —
-so results can be reviewed model-by-model instead of waiting for one long
-run. See ENGINEERING_DECISIONS.md (2026-08-26) for why.
+This is the methodology pipeline: it classifies a fixed sample of CIFAR-10-C
+images across every configured model and severity level, and appends one row
+per (model, severity, image) test to RESULTS_CSV as each result completes —
+never buffered to the end of the run.
 
-Resume-safe: any (model, blur_type, severity, image_id) already present in
-results.csv is skipped, so an interrupted or manually-paused run can always
-be restarted without re-paying for completed calls.
+Resume-safe: on every start (including a restart after a crash, a stopped
+run, or running out of API credit), it re-reads RESULTS_CSV first and skips
+any (model, blur_type, severity, image_id) already recorded there. A test is
+only ever paid for once.
 
-Currently scoped to motion_blur only (see ENGINEERING_DECISIONS.md) — rerun
-with BLUR_TYPE/CORRUPTION_FILE changed for glass_blur / defocus_blur later;
-existing rows are untouched since they key on blur_type too.
+Starts from scratch: this script never reads or reuses results.csv or
+results_mini.csv from earlier runs — only RESULTS_CSV below.
+
+See ENGINEERING_DECISIONS.md for why this schema/design looks the way it
+does, and Research context.md for the overall study design.
 """
 
-import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from src.classify import classify_image
-from src.client import get_client
-from src.config import CONCURRENCY, IMAGES_PER_CLASS, INT_TO_LABEL, MODEL_IDS, SEVERITIES
+from src.classify import classify_image_with_metrics
+from src.client import get_client, get_remaining_credits
+from src.config import CIFAR10_LABELS, DETAILED_RESULT_FIELDS, MODEL_IDS, SEVERITIES
 from src.data import build_fixed_sample, get_image, load_corruption, load_labels
 from src.persist import append_result, load_completed_keys
 
-RESULTS_CSV = "results/results.csv"
+# ============================== RUN CONFIGURATION ==============================
+# Edit these to control exactly what this run covers. Nothing below this
+# block needs to change for a normal configuration change.
+
+# Which models to test — a {short_name: openrouter_model_id} dict. Defaults
+# to the full roster (src/config.py:MODEL_IDS). Trim it to run a subset,
+# e.g. MODELS_TO_RUN = {"claude_opus": MODEL_IDS["claude_opus"]}.
+MODELS_TO_RUN = MODEL_IDS
+
+# Which corruption file this run covers. Only motion_blur for now (see
+# ENGINEERING_DECISIONS.md) — glass_blur/defocus_blur are separate future
+# runs against their own RESULTS_CSV, not mixed into this one.
 BLUR_TYPE = "motion_blur"
 CORRUPTION_FILE = "data/motion_blur.npy"
 
-# Touch this file to release the pause between models. File-based rather than
-# input() so the run can be driven from outside its own terminal (e.g. a
-# supervising script/process) as well as interactively.
-CONTINUE_SIGNAL_PATH = "results/.continue_signal"
+# Which severities to test. Defaults to all 5 (the full research design).
+SEVERITIES_TO_RUN = SEVERITIES
+
+# Which base images to test. Leave IMAGE_IDS as None to auto-build a fixed
+# sample of IMAGES_PER_CLASS images per CIFAR-10 class (the first N found in
+# dataset order, not random — see ENGINEERING_DECISIONS.md). Set IMAGE_IDS to
+# an explicit list of base image indices instead to override this entirely,
+# e.g. IMAGE_IDS = [0, 1, 2, 3, 4] for a small manual test.
+IMAGES_PER_CLASS = 140
+IMAGE_IDS = None
+
+# Output file. Brand new — never reads or overwrites results.csv or
+# results_mini.csv from earlier runs.
+RESULTS_CSV = "results/results_motion.csv"
+
+# How many calls to run at once, spread across MODELS_TO_RUN (so this isn't
+# hammering any single provider's rate limit — see ENGINEERING_DECISIONS.md).
+CONCURRENCY = 40
+
+# Live balance safeguard: a background thread checks your real OpenRouter
+# balance (not an estimate) every BALANCE_CHECK_INTERVAL_SECONDS, and stops
+# any calls not already in flight once it drops below MIN_BALANCE_USD. See
+# ENGINEERING_DECISIONS.md.
+MIN_BALANCE_USD = 1.0
+BALANCE_CHECK_INTERVAL_SECONDS = 20
+# ================================================================================
 
 
-def run_model(client, model_key, model_id, sample, labels, corruption, completed, lock):
-    """Classify every (severity, image) pair in `sample` for one model.
+def build_sample(labels):
+    if IMAGE_IDS is not None:
+        return list(IMAGE_IDS)
+    return build_fixed_sample(labels, IMAGES_PER_CLASS)
 
-    Skips pairs already in `completed`. Runs the remaining calls across a
-    small thread pool for speed, writing each result to disk as it lands.
+
+def watch_balance(stop_event):
+    """Background thread: stop new calls once real balance drops too low.
+
+    Doesn't cancel calls already in flight — just stops new ones from being
+    made, so a low-balance stop is clean rather than an abrupt kill.
     """
+    while not stop_event.is_set():
+        try:
+            remaining = get_remaining_credits()
+            if remaining < MIN_BALANCE_USD:
+                print(
+                    f"\nLOW BALANCE: ${remaining:.2f} remaining "
+                    f"(below ${MIN_BALANCE_USD:.2f} threshold). Stopping new calls — "
+                    f"add funds and rerun to pick up where this left off."
+                )
+                stop_event.set()
+                return
+        except Exception as e:
+            print(f"  (balance check failed, will retry: {e})")
+        stop_event.wait(BALANCE_CHECK_INTERVAL_SECONDS)
+
+
+def main():
+    client = get_client()
+    labels = load_labels("data/labels.npy")
+    corruption = load_corruption(CORRUPTION_FILE)
+    sample = build_sample(labels)
+    completed = load_completed_keys(RESULTS_CSV)
+    lock = threading.Lock()
+
+    starting_balance = get_remaining_credits()
+    print(f"Starting balance: ${starting_balance:.2f} (stop threshold: ${MIN_BALANCE_USD:.2f})")
+    if starting_balance < MIN_BALANCE_USD:
+        print("Already below the stop threshold — add funds before running.")
+        return
+
+    stop_event = threading.Event()
+    watcher = threading.Thread(target=watch_balance, args=(stop_event,), daemon=True)
+    watcher.start()
+
     tasks = [
-        (severity, image_id)
-        for severity in SEVERITIES
+        (model_key, model_id, severity, image_id)
+        for model_key, model_id in MODELS_TO_RUN.items()
+        for severity in SEVERITIES_TO_RUN
         for image_id in sample
         if (model_key, BLUR_TYPE, severity, image_id) not in completed
     ]
-
-    total = len(sample) * len(SEVERITIES)
-    if not tasks:
-        print(f"{model_key}: all {total} rows already done, nothing to do.")
-        return
-
-    print(f"{model_key}: {len(tasks)}/{total} calls remaining.")
+    total_planned = len(MODELS_TO_RUN) * len(SEVERITIES_TO_RUN) * len(sample)
+    print(
+        f"Blur type: {BLUR_TYPE} | models: {len(MODELS_TO_RUN)} | "
+        f"severities: {len(SEVERITIES_TO_RUN)} | sample: {len(sample)} images | "
+        f"concurrency: {CONCURRENCY}"
+    )
+    print(f"{len(tasks)}/{total_planned} calls remaining (rest already in {RESULTS_CSV}).")
 
     def do_one(task):
-        severity, image_id = task
+        if stop_event.is_set():
+            return
+        model_key, model_id, severity, image_id = task
         image_array = get_image(corruption, image_id, severity)
-        true_label = INT_TO_LABEL[int(labels[image_id])]
+        true_label = CIFAR10_LABELS[int(labels[image_id])]
 
-        prediction = None
+        raw_response = prediction = latency_seconds = cost_usd = None
         for attempt in range(3):
             try:
-                prediction = classify_image(client, model_id, image_array)
+                raw_response, prediction, latency_seconds, cost_usd = classify_image_with_metrics(
+                    client, model_id, image_array
+                )
                 break
             except Exception as e:
                 if attempt == 2:
@@ -73,55 +153,32 @@ def run_model(client, model_key, model_id, sample, labels, corruption, completed
 
         row = {
             "model": model_key,
+            "model_id": model_id,
             "blur_type": BLUR_TYPE,
             "severity": severity,
             "image_id": image_id,
             "true_label": true_label,
+            "raw_response": raw_response,
             "prediction": prediction,
+            "valid_response": int(prediction in CIFAR10_LABELS),
             "correct": int(prediction == true_label),
+            "latency_seconds": round(latency_seconds, 3),
+            "cost_usd": cost_usd if cost_usd is not None else "N/A",
         }
         with lock:
-            append_result(row, RESULTS_CSV)
+            append_result(row, RESULTS_CSV, fieldnames=DETAILED_RESULT_FIELDS)
             completed.add((model_key, BLUR_TYPE, severity, image_id))
 
     finished = 0
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
         for _ in executor.map(do_one, tasks):
             finished += 1
-            if finished % 200 == 0:
-                print(f"  {model_key}: {finished}/{len(tasks)}")
+            if finished % 500 == 0:
+                print(f"  {finished}/{len(tasks)}")
 
-    print(f"{model_key}: finished this pass ({len(tasks)} calls attempted).")
-
-
-def main():
-    client = get_client()
-    labels = load_labels("data/labels.npy")
-    corruption = load_corruption(CORRUPTION_FILE)
-    sample = build_fixed_sample(labels, IMAGES_PER_CLASS)
-    completed = load_completed_keys(RESULTS_CSV)
-    lock = threading.Lock()
-
-    model_items = list(MODEL_IDS.items())
-    total_planned = len(sample) * len(SEVERITIES) * len(model_items)
-    print(
-        f"Blur type: {BLUR_TYPE} | sample: {len(sample)} images | "
-        f"severities: {len(SEVERITIES)} | models: {len(model_items)} | "
-        f"total calls planned: {total_planned}"
-    )
-
-    for i, (model_key, model_id) in enumerate(model_items):
-        print(f"\n=== [{i + 1}/{len(model_items)}] {model_key} ({model_id}) ===")
-        run_model(client, model_key, model_id, sample, labels, corruption, completed, lock)
-        print("done")
-
-        if i < len(model_items) - 1:
-            next_model = model_items[i + 1][0]
-            print(f"Waiting to continue to {next_model} (touch {CONTINUE_SIGNAL_PATH})...")
-            while not os.path.exists(CONTINUE_SIGNAL_PATH):
-                time.sleep(1)
-            os.remove(CONTINUE_SIGNAL_PATH)
-            print(f"Continuing to {next_model}...")
+    stop_event.set()  # let the watcher thread exit
+    status = "stopped early on low balance" if len(completed) < total_planned else "all done"
+    print(f"\n{status}. {RESULTS_CSV} has {len(completed)}/{total_planned} rows.")
 
 
 if __name__ == "__main__":

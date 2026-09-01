@@ -11,13 +11,13 @@ import os
 from src.config import RESULT_FIELDS
 
 
-def append_result(row, csv_path):
+def append_result(row, csv_path, fieldnames=RESULT_FIELDS):
     """Append one result row to csv_path, creating it with a header if needed."""
     file_exists = os.path.exists(csv_path)
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
 
     with open(csv_path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=RESULT_FIELDS)
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
@@ -30,6 +30,8 @@ def load_completed_keys(csv_path):
 
     Used to make a run resumable: skip any call whose result is already on disk,
     whether the previous run was interrupted or manually paused between models.
+    Works for any CSV that has these four columns, regardless of what other
+    columns it also carries.
     """
     completed = set()
     if not os.path.exists(csv_path):
