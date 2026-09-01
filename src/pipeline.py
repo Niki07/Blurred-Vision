@@ -20,6 +20,7 @@ does, and Research context.md for the overall study design.
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from itertools import zip_longest
 
 from src.classify import classify_image_with_metrics
 from src.client import get_client, get_remaining_credits
@@ -59,7 +60,13 @@ RESULTS_CSV = "results/results_motion.csv"
 
 # How many calls to run at once, spread across MODELS_TO_RUN (so this isn't
 # hammering any single provider's rate limit — see ENGINEERING_DECISIONS.md).
-CONCURRENCY = 40
+# Lowered from 40 to 10 (2026-08-31): OpenRouter's per-account in-flight
+# budget cap shrinks as real balance drops, so the same concurrency that was
+# safe at $21 started tripping 402 in_flight_budget_exhausted errors more
+# often as balance fell past ~$8. Interleaving (below) fixed the "40
+# concurrent calls to one expensive model" case; this fixes the "any 40
+# concurrent calls at all once balance is low" case.
+CONCURRENCY = 10
 
 # Live balance safeguard: a background thread checks your real OpenRouter
 # balance (not an estimate) every BALANCE_CHECK_INTERVAL_SECONDS, and stops
@@ -116,12 +123,25 @@ def main():
     watcher = threading.Thread(target=watch_balance, args=(stop_event,), daemon=True)
     watcher.start()
 
-    tasks = [
-        (model_key, model_id, severity, image_id)
+    # Interleaved round-robin across models (not grouped model-by-model) so
+    # CONCURRENCY workers always pull a mix of cheap and expensive models at
+    # once, rather than bursting dozens of concurrent calls to one flagship
+    # model — that burst tripped OpenRouter's per-request in-flight budget
+    # cap (a 402, distinct from actually running out of balance) during the
+    # first live run. See ENGINEERING_DECISIONS.md.
+    per_model_tasks = [
+        [
+            (model_key, model_id, severity, image_id)
+            for severity in SEVERITIES_TO_RUN
+            for image_id in sample
+        ]
         for model_key, model_id in MODELS_TO_RUN.items()
-        for severity in SEVERITIES_TO_RUN
-        for image_id in sample
-        if (model_key, BLUR_TYPE, severity, image_id) not in completed
+    ]
+    tasks = [
+        task
+        for round_ in zip_longest(*per_model_tasks)
+        for task in round_
+        if task is not None and (task[0], BLUR_TYPE, task[2], task[3]) not in completed
     ]
     total_planned = len(MODELS_TO_RUN) * len(SEVERITIES_TO_RUN) * len(sample)
     print(
@@ -149,7 +169,7 @@ def main():
                 if attempt == 2:
                     print(f"  ERROR {model_key} sev{severity} img{image_id}: {e}")
                     return
-                time.sleep(2 * (attempt + 1))
+                time.sleep(5 * (attempt + 1))
 
         row = {
             "model": model_key,
