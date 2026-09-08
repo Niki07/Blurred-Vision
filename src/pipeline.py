@@ -1,17 +1,22 @@
-"""Motion-blur data-collection pipeline for the blur-robustness paper.
+"""Blur-robustness data-collection pipeline for the paper.
 
-This is the methodology pipeline: it classifies a fixed sample of CIFAR-10-C
-images across every configured model and severity level, and appends one row
-per (model, severity, image) test to RESULTS_CSV as each result completes —
-never buffered to the end of the run.
+This is the methodology pipeline: run_blur_experiment(blur_name) classifies
+a fixed sample of CIFAR-10-C images across every configured model and
+severity level for one blur corruption (motion/glass/defocus), appending one
+row per (model, severity, image) test to its own results CSV as each result
+completes — never buffered to the end of the run.
+
+Each blur type gets its own folder and CSV (results/<blur>/results_<blur>.csv)
+so runs never overwrite or mix with each other:
+
+    run_blur_experiment("motion")    -> results/motion/results_motion.csv
+    run_blur_experiment("defocus")   -> results/defocus/results_defocus.csv
+    run_blur_experiment("glass")     -> results/glass/results_glass.csv
 
 Resume-safe: on every start (including a restart after a crash, a stopped
-run, or running out of API credit), it re-reads RESULTS_CSV first and skips
-any (model, blur_type, severity, image_id) already recorded there. A test is
-only ever paid for once.
-
-Starts from scratch: this script never reads or reuses results.csv or
-results_mini.csv from earlier runs — only RESULTS_CSV below.
+run, or running out of API credit), it re-reads that blur's results CSV
+first and skips any (model, blur_type, severity, image_id) already recorded
+there. A test is only ever paid for once.
 
 See ENGINEERING_DECISIONS.md for why this schema/design looks the way it
 does, and Research context.md for the overall study design.
@@ -28,62 +33,43 @@ from src.config import CIFAR10_LABELS, DETAILED_RESULT_FIELDS, MODEL_IDS, SEVERI
 from src.data import build_fixed_sample, get_image, load_corruption, load_labels
 from src.persist import append_result, load_completed_keys
 
-# ============================== RUN CONFIGURATION ==============================
-# Edit these to control exactly what this run covers. Nothing below this
-# block needs to change for a normal configuration change.
+# ============================== DEFAULT CONFIGURATION ==============================
+# Defaults for run_blur_experiment()'s keyword arguments. Override per-call
+# rather than editing these, e.g. run_blur_experiment("glass", concurrency=20).
 
-# Which models to test — a {short_name: openrouter_model_id} dict. Defaults
-# to the full roster (src/config.py:MODEL_IDS). Trim it to run a subset,
-# e.g. MODELS_TO_RUN = {"claude_opus": MODEL_IDS["claude_opus"]}.
-MODELS_TO_RUN = MODEL_IDS
+# Which models to test by default — a {short_name: openrouter_model_id} dict.
+DEFAULT_MODELS = MODEL_IDS
 
-# Which corruption file this run covers. Only motion_blur for now (see
-# ENGINEERING_DECISIONS.md) — glass_blur/defocus_blur are separate future
-# runs against their own RESULTS_CSV, not mixed into this one.
-BLUR_TYPE = "motion_blur"
-CORRUPTION_FILE = "data/motion_blur.npy"
+# Which severities to test by default. All 5 (the full research design).
+DEFAULT_SEVERITIES = SEVERITIES
 
-# Which severities to test. Defaults to all 5 (the full research design).
-SEVERITIES_TO_RUN = SEVERITIES
+# Default fixed sample: first N base images per class, in dataset order (not
+# random) — see ENGINEERING_DECISIONS.md. Pass image_ids= to override with an
+# explicit list of base image indices instead, e.g. for a small manual test.
+DEFAULT_IMAGES_PER_CLASS = 140
 
-# Which base images to test. Leave IMAGE_IDS as None to auto-build a fixed
-# sample of IMAGES_PER_CLASS images per CIFAR-10 class (the first N found in
-# dataset order, not random — see ENGINEERING_DECISIONS.md). Set IMAGE_IDS to
-# an explicit list of base image indices instead to override this entirely,
-# e.g. IMAGE_IDS = [0, 1, 2, 3, 4] for a small manual test.
-IMAGES_PER_CLASS = 140
-IMAGE_IDS = None
-
-# Output file. Brand new — never reads or overwrites results.csv or
-# results_mini.csv from earlier runs.
-RESULTS_CSV = "results/results_motion.csv"
-
-# How many calls to run at once, spread across MODELS_TO_RUN (so this isn't
+# How many calls to run at once, spread across all models (so this isn't
 # hammering any single provider's rate limit — see ENGINEERING_DECISIONS.md).
-# Lowered from 40 to 10 (2026-08-31): OpenRouter's per-account in-flight
-# budget cap shrinks as real balance drops, so the same concurrency that was
-# safe at $21 started tripping 402 in_flight_budget_exhausted errors more
-# often as balance fell past ~$8. Interleaving (below) fixed the "40
-# concurrent calls to one expensive model" case; this fixes the "any 40
-# concurrent calls at all once balance is low" case.
-CONCURRENCY = 10
+# 20 as a starting default: fast enough, and a bit more conservative than the
+# 40 used for motion's first pass, which needed lowering to 10 partway
+# through as balance dropped and OpenRouter's in-flight budget cap tightened.
+DEFAULT_CONCURRENCY = 20
 
-# Live balance safeguard: a background thread checks your real OpenRouter
-# balance (not an estimate) every BALANCE_CHECK_INTERVAL_SECONDS, and stops
-# any calls not already in flight once it drops below MIN_BALANCE_USD. See
-# ENGINEERING_DECISIONS.md.
-MIN_BALANCE_USD = 1.0
-BALANCE_CHECK_INTERVAL_SECONDS = 20
-# ================================================================================
+# Live balance safeguard defaults: a background thread checks your real
+# OpenRouter balance every BALANCE_CHECK_INTERVAL_SECONDS and stops any calls
+# not already in flight once it drops below MIN_BALANCE_USD.
+DEFAULT_MIN_BALANCE_USD = 1.0
+DEFAULT_BALANCE_CHECK_INTERVAL_SECONDS = 20
+# =====================================================================================
 
 
-def build_sample(labels):
-    if IMAGE_IDS is not None:
-        return list(IMAGE_IDS)
-    return build_fixed_sample(labels, IMAGES_PER_CLASS)
+def build_sample(labels, images_per_class, image_ids):
+    if image_ids is not None:
+        return list(image_ids)
+    return build_fixed_sample(labels, images_per_class)
 
 
-def watch_balance(stop_event):
+def watch_balance(stop_event, min_balance_usd, check_interval_seconds):
     """Background thread: stop new calls once real balance drops too low.
 
     Doesn't cancel calls already in flight — just stops new ones from being
@@ -92,64 +78,90 @@ def watch_balance(stop_event):
     while not stop_event.is_set():
         try:
             remaining = get_remaining_credits()
-            if remaining < MIN_BALANCE_USD:
+            if remaining < min_balance_usd:
                 print(
                     f"\nLOW BALANCE: ${remaining:.2f} remaining "
-                    f"(below ${MIN_BALANCE_USD:.2f} threshold). Stopping new calls — "
+                    f"(below ${min_balance_usd:.2f} threshold). Stopping new calls — "
                     f"add funds and rerun to pick up where this left off."
                 )
                 stop_event.set()
                 return
         except Exception as e:
             print(f"  (balance check failed, will retry: {e})")
-        stop_event.wait(BALANCE_CHECK_INTERVAL_SECONDS)
+        stop_event.wait(check_interval_seconds)
 
 
-def main():
+def run_blur_experiment(
+    blur_name,
+    models_to_run=None,
+    severities_to_run=None,
+    images_per_class=DEFAULT_IMAGES_PER_CLASS,
+    image_ids=None,
+    concurrency=DEFAULT_CONCURRENCY,
+    min_balance_usd=DEFAULT_MIN_BALANCE_USD,
+    balance_check_interval_seconds=DEFAULT_BALANCE_CHECK_INTERVAL_SECONDS,
+):
+    """Run (or resume) the full data-collection pass for one blur corruption.
+
+    blur_name: "motion", "glass", or "defocus" — derives the CIFAR-10-C file
+    (data/<blur_name>_blur.npy), the blur_type recorded in each row
+    (<blur_name>_blur), and the output CSV (results/<blur_name>/results_<blur_name>.csv).
+    """
+    models_to_run = models_to_run if models_to_run is not None else DEFAULT_MODELS
+    severities_to_run = severities_to_run if severities_to_run is not None else DEFAULT_SEVERITIES
+
+    blur_type = f"{blur_name}_blur"
+    corruption_file = f"data/{blur_type}.npy"
+    results_csv = f"results/{blur_name}/results_{blur_name}.csv"
+
     client = get_client()
     labels = load_labels("data/labels.npy")
-    corruption = load_corruption(CORRUPTION_FILE)
-    sample = build_sample(labels)
-    completed = load_completed_keys(RESULTS_CSV)
+    corruption = load_corruption(corruption_file)
+    sample = build_sample(labels, images_per_class, image_ids)
+    completed = load_completed_keys(results_csv)
     lock = threading.Lock()
 
     starting_balance = get_remaining_credits()
-    print(f"Starting balance: ${starting_balance:.2f} (stop threshold: ${MIN_BALANCE_USD:.2f})")
-    if starting_balance < MIN_BALANCE_USD:
-        print("Already below the stop threshold — add funds before running.")
+    print(f"[{blur_name}] Starting balance: ${starting_balance:.2f} (stop threshold: ${min_balance_usd:.2f})")
+    if starting_balance < min_balance_usd:
+        print(f"[{blur_name}] Already below the stop threshold — add funds before running.")
         return
 
     stop_event = threading.Event()
-    watcher = threading.Thread(target=watch_balance, args=(stop_event,), daemon=True)
+    watcher = threading.Thread(
+        target=watch_balance,
+        args=(stop_event, min_balance_usd, balance_check_interval_seconds),
+        daemon=True,
+    )
     watcher.start()
 
     # Interleaved round-robin across models (not grouped model-by-model) so
-    # CONCURRENCY workers always pull a mix of cheap and expensive models at
-    # once, rather than bursting dozens of concurrent calls to one flagship
-    # model — that burst tripped OpenRouter's per-request in-flight budget
-    # cap (a 402, distinct from actually running out of balance) during the
-    # first live run. See ENGINEERING_DECISIONS.md.
+    # `concurrency` workers always pull a mix of cheap and expensive models
+    # at once, rather than bursting dozens of concurrent calls to one
+    # flagship model — that burst tripped OpenRouter's per-request in-flight
+    # budget cap (a 402, distinct from actually running out of balance)
+    # during the motion run. See ENGINEERING_DECISIONS.md.
     per_model_tasks = [
         [
             (model_key, model_id, severity, image_id)
-            for severity in SEVERITIES_TO_RUN
+            for severity in severities_to_run
             for image_id in sample
         ]
-        for model_key, model_id in MODELS_TO_RUN.items()
+        for model_key, model_id in models_to_run.items()
     ]
     tasks = [
         task
         for round_ in zip_longest(*per_model_tasks)
         for task in round_
-        if task is not None and (task[0], BLUR_TYPE, task[2], task[3]) not in completed
+        if task is not None and (task[0], blur_type, task[2], task[3]) not in completed
     ]
-    total_planned = len(MODELS_TO_RUN) * len(SEVERITIES_TO_RUN) * len(sample)
+    total_planned = len(models_to_run) * len(severities_to_run) * len(sample)
     print(
-        f"Blur type: {BLUR_TYPE} | models: {len(MODELS_TO_RUN)} | "
-        f"severities: {len(SEVERITIES_TO_RUN)} | sample: {len(sample)} images | "
-        f"concurrency: {CONCURRENCY}"
+        f"[{blur_name}] Blur type: {blur_type} | models: {len(models_to_run)} | "
+        f"severities: {len(severities_to_run)} | sample: {len(sample)} images | "
+        f"concurrency: {concurrency}"
     )
-    print(f"{len(tasks)}/{total_planned} calls remaining (rest already in {RESULTS_CSV}).")
+    print(f"[{blur_name}] {len(tasks)}/{total_planned} calls remaining (rest already in {results_csv}).")
 
     def do_one(task):
         if stop_event.is_set():
@@ -167,14 +179,14 @@ def main():
                 break
             except Exception as e:
                 if attempt == 2:
-                    print(f"  ERROR {model_key} sev{severity} img{image_id}: {e}")
+                    print(f"[{blur_name}]   ERROR {model_key} sev{severity} img{image_id}: {e}")
                     return
                 time.sleep(5 * (attempt + 1))
 
         row = {
             "model": model_key,
             "model_id": model_id,
-            "blur_type": BLUR_TYPE,
+            "blur_type": blur_type,
             "severity": severity,
             "image_id": image_id,
             "true_label": true_label,
@@ -186,20 +198,22 @@ def main():
             "cost_usd": cost_usd if cost_usd is not None else "N/A",
         }
         with lock:
-            append_result(row, RESULTS_CSV, fieldnames=DETAILED_RESULT_FIELDS)
-            completed.add((model_key, BLUR_TYPE, severity, image_id))
+            append_result(row, results_csv, fieldnames=DETAILED_RESULT_FIELDS)
+            completed.add((model_key, blur_type, severity, image_id))
 
     finished = 0
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
         for _ in executor.map(do_one, tasks):
             finished += 1
             if finished % 500 == 0:
-                print(f"  {finished}/{len(tasks)}")
+                print(f"[{blur_name}]   {finished}/{len(tasks)}")
 
     stop_event.set()  # let the watcher thread exit
     status = "stopped early on low balance" if len(completed) < total_planned else "all done"
-    print(f"\n{status}. {RESULTS_CSV} has {len(completed)}/{total_planned} rows.")
+    print(f"\n[{blur_name}] {status}. {results_csv} has {len(completed)}/{total_planned} rows.")
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    run_blur_experiment(sys.argv[1] if len(sys.argv) > 1 else "motion")
