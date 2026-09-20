@@ -1,6 +1,6 @@
 # Blurred Vision: Comparing Multimodal AI Image Classification Across Blur Types and Severity Levels
 
-**Status: work in progress.** Proof-of-concept pipeline works end-to-end; the fixed model IDs, image sample, and full experiment loop are still TODO (see `src/config.py` and `src/pipeline.py`).
+**Status: Status: Complete
 
 ## Overview
 
